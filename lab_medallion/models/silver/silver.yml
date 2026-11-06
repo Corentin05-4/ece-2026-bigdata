@@ -7,6 +7,10 @@ models:
         data_tests:
           - unique
           - not_null
+      - name: username_normalized
+        description: Username cleaned and converted to lowercase.
+        data_tests:
+          - not_null
       - name: email
         data_tests:
           - unique

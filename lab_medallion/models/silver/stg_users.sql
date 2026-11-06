@@ -19,6 +19,7 @@ typed as (
 select
     user_id,
     username,
+    lower(trim(username)) as username_normalized,
     name,
     sex,
     email,
