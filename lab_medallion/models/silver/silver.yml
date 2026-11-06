@@ -11,6 +11,12 @@ models:
         description: Username cleaned and converted to lowercase.
         data_tests:
           - not_null
+      - name: birthdate
+        description: Validated birthdate, NULL if invalid.
+      - name: birthdate_is_valid
+        description: Whether the original birthdate is valid.
+        data_tests:
+          - not_null
       - name: email
         data_tests:
           - unique

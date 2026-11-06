@@ -9,11 +9,31 @@ typed as (
         trim(name) as name,
         upper(trim(sex)) as sex,
         lower(trim(mail)) as email,
-        cast(birthdate as date) as birthdate,
-        -- The address spans 2 lines
+        cast(birthdate as date) as raw_birthdate,
         split_part(address, chr(10), 1) as street,
         split_part(address, chr(10), 2) as address_line_2
     from source
+),
+
+first_orders as (
+    select
+        user_id,
+        min(ordered_at)::date as first_order_date
+    from {{ ref('stg_orders') }}
+    group by user_id
+),
+
+validated as (
+    select
+        t.*,
+        case
+            when t.raw_birthdate is null then false
+            when f.first_order_date is not null
+                 and t.raw_birthdate > f.first_order_date then false
+            else true
+        end as birthdate_is_valid
+    from typed t
+    left join first_orders f on t.user_id = f.user_id
 )
 
 select
@@ -23,10 +43,13 @@ select
     name,
     sex,
     email,
-    birthdate,
+    case
+        when birthdate_is_valid then raw_birthdate
+        else null
+    end as birthdate,
+    birthdate_is_valid,
     street,
-    -- Military addresses have no comma
     nullif(regexp_extract(address_line_2, '^(.+), [A-Z]{2} \d{5}$', 1), '') as city,
     regexp_extract(address_line_2, '([A-Z]{2}) (\d{5})$', 1) as state,
     regexp_extract(address_line_2, '([A-Z]{2}) (\d{5})$', 2) as zip_code
-from typed
+from validated

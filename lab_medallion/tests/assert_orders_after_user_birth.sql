@@ -1,5 +1,3 @@
-{{ config(severity='warn') }}
-
 -- A user cannot order before being born
 select
     o.order_id,
