@@ -7,3 +7,9 @@ __pycache__/
 *.duckdb.wal
 init.sql
 orders_large.csv
+
+# dbt
+target/
+dbt_packages/
+logs/
+*.duckdb
