@@ -1,0 +1,138 @@
+postgresql:
+  auth:
+    username: polaris
+    database: polaris
+    existingSecret: polaris-db
+  primary:
+    initdb:
+      scripts:
+        01-create-polaris-schema.sql: |
+          CREATE SCHEMA IF NOT EXISTS polaris_schema AUTHORIZATION polaris;
+    persistence:
+      size: 1Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+
+polaris:
+  persistence:
+    type: relational-jdbc
+    relationalJdbc:
+      secret:
+        name: polaris-db
+        username: username
+        password: password
+        jdbcUrl: jdbcUrl
+
+  livenessProbe:
+    initialDelaySeconds: 180
+    periodSeconds: 15
+    failureThreshold: 6
+    timeoutSeconds: 10
+
+  readinessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    failureThreshold: 6
+    timeoutSeconds: 10
+
+  authentication:
+    type: internal
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  envFrom:
+    - configMapRef:
+        name: polaris-config
+
+  extraEnv:
+    - name: POLARIS_BOOTSTRAP_CREDENTIALS
+      valueFrom:
+        secretKeyRef:
+          name: polaris-credential
+          key: POLARIS_BOOTSTRAP_CREDENTIALS
+
+    - name: AWS_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: polaris-s3
+          key: AWS_ACCESS_KEY_ID
+
+    - name: AWS_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: polaris-s3
+          key: AWS_SECRET_ACCESS_KEY
+
+    - name: AWS_SESSION_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: polaris-s3
+          key: AWS_SESSION_TOKEN
+
+    - name: AWS_REGION
+      value: us-east-1
+
+  extraInitContainers:
+    - name: polaris-bootstrap
+      image: apache/polaris-admin-tool:1.8.0
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      env:
+        - name: QUARKUS_DATASOURCE_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: polaris-db
+              key: username
+        - name: QUARKUS_DATASOURCE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: polaris-db
+              key: password
+        - name: QUARKUS_DATASOURCE_JDBC_URL
+          valueFrom:
+            secretKeyRef:
+              name: polaris-db
+              key: jdbcUrl
+        - name: POLARIS_PERSISTENCE_TYPE
+          value: relational-jdbc
+        - name: ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: polaris-credential
+              key: POLARIS_ROOT_SECRET
+      command: ["/bin/sh", "-ec"]
+      args:
+        - |
+          attempt=0
+          while [ "$attempt" -lt 40 ]; do
+            attempt=$((attempt + 1))
+            if output=$(java -jar /deployments/polaris-admin-tool.jar bootstrap \
+              -r POLARIS -c "POLARIS,root,${ROOT_PASSWORD}" 2>&1); then
+              echo "Polaris initialized"
+              exit 0
+            fi
+            if echo "$output" | grep -qi "already been bootstrapped"; then
+              echo "Polaris already initialized"
+              exit 0
+            fi
+            echo "Waiting for database initialization..."
+            sleep 5
+          done
+          echo "Polaris initialization failed" >&2
+          exit 1

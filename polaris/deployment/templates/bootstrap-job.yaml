@@ -1,0 +1,221 @@
+apiVersion: batch/v1
+kind: Job
+
+metadata:
+  name: polaris-bootstrap
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "10"
+    helm.sh/hook-delete-policy: before-hook-creation
+
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bootstrap
+          image: alpine:3.21
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 56Mi
+          envFrom:
+            - configMapRef:
+                name: polaris-config
+          env:
+            - name: POLARIS_ROOT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: polaris-credential
+                  key: POLARIS_ROOT_SECRET
+            - name: LAB_BUCKET_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              apk add --no-cache curl jq
+
+              until curl -fsS \
+                "${POLARIS_MGMT_URI}/q/health/ready" \
+                >/dev/null; do
+                echo "Waiting for Polaris..."
+                sleep 5
+              done
+
+              API="${POLARIS_URI%/}/api/management/v1"
+
+              TOKEN=$(curl -fsS \
+                -u "${POLARIS_CLIENT_ID}:${POLARIS_ROOT_SECRET}" \
+                -H "Polaris-Realm: ${POLARIS_REALM}" \
+                -d grant_type=client_credentials \
+                -d scope=PRINCIPAL_ROLE:ALL \
+                "${POLARIS_URI%/}/api/catalog/v1/oauth/tokens" \
+                | jq -er '.access_token')
+
+              status() {
+                curl -sS -o /dev/null -w '%{http_code}' \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  -H "Polaris-Realm: ${POLARIS_REALM}" "$1"
+              }
+
+              api_get() {
+                curl -fsS \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  -H "Polaris-Realm: ${POLARIS_REALM}" "$1"
+              }
+
+              api_post() {
+                curl -fsS -X POST \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  -H "Polaris-Realm: ${POLARIS_REALM}" \
+                  -H "Content-Type: application/json" \
+                  -d "$2" "$1"
+              }
+
+              api_put() {
+                curl -fsS -X PUT \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  -H "Polaris-Realm: ${POLARIS_REALM}" \
+                  -H "Content-Type: application/json" \
+                  -d "$2" "$1"
+              }
+
+              ensure_resource() {
+                path="$1"
+                name="$2"
+                payload="$3"
+
+                case "$(status "${API}/${path}/${name}")" in
+                  200) echo "${path}/${name} already exists" ;;
+                  404)
+                    result=$(api_post "${API}/${path}" "$payload")
+                    echo "${path}/${name} created"
+                    if [ "$path" = "principals" ]; then
+                      echo "$result" | jq -c '{
+                        principal: .principal.name,
+                        credentials: .credentials
+                      }'
+                    fi
+                    ;;
+                  *) echo "Failed checking ${path}/${name}" >&2; exit 1 ;;
+                esac
+              }
+
+              for name in dev analyst; do
+                payload=$(jq -nc --arg n "$name" \
+                  '{principal:{name:$n,properties:{}},
+                    credentialRotationRequired:false}')
+                ensure_resource principals "$name" "$payload"
+              done
+
+              for name in data_engineer data_analyst; do
+                payload=$(jq -nc --arg n "$name" \
+                  '{principalRole:{name:$n,properties:{}}}')
+                ensure_resource principal-roles "$name" "$payload"
+              done
+
+              catalog="${POLARIS_CATALOG}"
+
+              payload=$(jq -nc \
+                --arg n "$catalog" \
+                --arg location "s3://${LAB_BUCKET_NAME}/warehouse/" \
+                '{
+                  catalog:{
+                    name:$n,
+                    type:"INTERNAL",
+                    properties:{"default-base-location":$location},
+                    storageConfigInfo:{
+                      storageType:"S3",
+                      allowedLocations:[$location],
+                      endpoint:"https://s3.seaweedfs.adm.adaltas.cloud",
+                      endpointInternal:"https://s3.seaweedfs.adm.adaltas.cloud",
+                      pathStyleAccess:true,
+                      region:"us-east-1",
+                      stsUnavailable:true
+                    }
+                  }
+                }')
+
+              ensure_resource catalogs "$catalog" "$payload"
+
+              for name in catalog_contributor catalog_reader; do
+                payload=$(jq -nc --arg n "$name" \
+                  '{catalogRole:{name:$n,properties:{}}}')
+
+                ensure_resource \
+                  "catalogs/${catalog}/catalog-roles" \
+                  "$name" "$payload"
+              done
+
+              grant() {
+                role="$1"
+                privilege="$2"
+                endpoint="${API}/catalogs/${catalog}/catalog-roles/${role}/grants"
+
+                if api_get "$endpoint" | jq -e \
+                  --arg p "$privilege" \
+                  '.grants[]? | select(.type=="catalog" and .privilege==$p)' \
+                  >/dev/null; then
+                  return
+                fi
+
+                payload=$(jq -nc --arg p "$privilege" \
+                  '{grant:{type:"catalog",privilege:$p}}')
+                api_put "$endpoint" "$payload" >/dev/null
+              }
+
+              for p in CATALOG_MANAGE_ACCESS CATALOG_MANAGE_METADATA CATALOG_MANAGE_CONTENT; do
+                grant catalog_contributor "$p"
+              done
+
+              for p in TABLE_READ_DATA TABLE_READ_PROPERTIES CATALOG_READ_PROPERTIES; do
+                grant catalog_reader "$p"
+              done
+
+              assign_principal() {
+                principal="$1"
+                role="$2"
+                endpoint="${API}/principals/${principal}/principal-roles"
+
+                if api_get "$endpoint" | jq -e \
+                  --arg r "$role" '.roles[]? | select(.name==$r)' \
+                  >/dev/null; then
+                  return
+                fi
+
+                payload=$(jq -nc --arg r "$role" \
+                  '{principalRole:{name:$r}}')
+                api_put "$endpoint" "$payload" >/dev/null
+              }
+
+              assign_catalog() {
+                principal_role="$1"
+                catalog_role="$2"
+                endpoint="${API}/principal-roles/${principal_role}/catalog-roles/${catalog}"
+
+                if api_get "$endpoint" | jq -e \
+                  --arg r "$catalog_role" '.roles[]? | select(.name==$r)' \
+                  >/dev/null; then
+                  return
+                fi
+
+                payload=$(jq -nc --arg r "$catalog_role" \
+                  '{catalogRole:{name:$r}}')
+                api_put "$endpoint" "$payload" >/dev/null
+              }
+
+              assign_principal dev data_engineer
+              assign_principal analyst data_analyst
+              assign_catalog data_engineer catalog_contributor
+              assign_catalog data_analyst catalog_reader
+
+              echo "POLARIS BOOTSTRAP COMPLETED"
